@@ -60,5 +60,8 @@ COPY --from=build /pynguin-build/pynguin-docker.sh .
 
 RUN pip install /pynguin/pynguin-$PYNGUIN_VERSION.tar.gz
 
+# Energy measurement libraries
+RUN pip install codecarbon ecologits
+
 ENTRYPOINT ["/pynguin/pynguin-docker.sh"]
 CMD []

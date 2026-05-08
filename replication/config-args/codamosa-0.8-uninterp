@@ -1,1 +1,1 @@
---model_name code-davinci-002 --include-partially-parsable True --allow-expandable-cluster True --algorithm CODAMOSA --temperature 0.8 --uninterpreted_statements ONLY
+--model_name gpt-4o-mini --include-partially-parsable True --allow-expandable-cluster True --algorithm CODAMOSA --temperature 0.8 --uninterpreted_statements ONLY --model_base_url https://api.openai.com --model_relative_url /v1/chat/completions

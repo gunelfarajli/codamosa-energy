@@ -15,6 +15,8 @@ import time
 from collections import defaultdict
 from datetime import datetime
 from typing import Dict, Iterable, List
+from codecarbon import EmissionsTracker
+from ecologits.tracers.utils import llm_impacts
 
 import requests
 
@@ -130,6 +132,17 @@ class _OpenAILanguageModel:
         self._token_len_cache = {}
         self.num_codex_calls: int = 0
         self.time_calling_codex: float = 0
+
+        self.inner_tracker = EmissionsTracker(
+            project_name="codamosa_targetedgen_preprocessing",
+            output_dir="/emissions",
+            save_to_file=True,
+            allow_multiple_runs=True,
+            log_level="error",
+        )
+        
+        self.llm_energy_kwh: float = 0.0
+        self.llm_co2_grams: float = 0.0
 
     @property
     def temperature(self) -> float:
@@ -338,9 +351,11 @@ class _OpenAILanguageModel:
         # We want to stop the generation before it spits out a bunch of other tests,
         # because that slows things down
 
+        self.inner_tracker.stop() # Stopping codecarbon here to exlude the api network waiting
         time_start = time.time()
         res = requests.post(url, data=json.dumps(payload), headers=headers)
         self.time_calling_codex += time.time() - time_start
+        self.inner_tracker.start() # Resume codecarbon local tracking
         self.num_codex_calls += 1
         stat.track_output_variable(RuntimeVariable.LLMCalls, self.num_codex_calls)
         stat.track_output_variable(
@@ -350,6 +365,19 @@ class _OpenAILanguageModel:
             logger.error("Failed to call for completion:\n%s", res.json())
             logger.error(self.complete_model)
             return ""
+        
+        usage = res.json().get("usage", {})
+        impacts = llm_impacts(
+            provider="openai",
+            model_name=self._complete_model,
+            output_token_count=usage.get("completion_tokens", 0),
+            request_latency=self.time_calling_codex,
+            electricity_mix_zone="GBR",   # UK grid CI applied inside EcoLogits
+        )
+        if impacts and not impacts.has_errors:
+            self.llm_energy_kwh += impacts.energy.value.mean
+            self.llm_co2_grams  += impacts.gwp.value.mean * 1000
+
         return res.json()["choices"][0]["text"]
 
     def _get_num_tokens_at_line(self, line_num: int) -> int:
@@ -408,75 +436,84 @@ class _OpenAILanguageModel:
             A generated test case as natural language.
 
         """
-        if gao.is_method():
-            method_gao: GenericMethod = gao  # type: ignore
-            function_header = (
-                f"# Unit test for method {method_gao.method_name} of "
-                f"class {method_gao.owner.__name__}\n"  # type: ignore
-                f"def test_{method_gao.owner.__name__}"
-                f"_{method_gao.method_name}():"
-            )
-            try:
-                source_lines, start_line = inspect.getsourcelines(method_gao.owner)  # type: ignore
-                end_line = start_line + len(source_lines) - 1
-                if (
-                    sum(
-                        [
-                            self._get_num_tokens_at_line(i)
-                            for i in range(start_line, end_line + 1)
-                        ]
-                    )
-                    > self._max_query_len
-                ):
+        self.inner_tracker.start() 
+        try:
+            if gao.is_method():
+                method_gao: GenericMethod = gao  # type: ignore
+                function_header = (
+                    f"# Unit test for method {method_gao.method_name} of "
+                    f"class {method_gao.owner.__name__}\n"  # type: ignore
+                    f"def test_{method_gao.owner.__name__}"
+                    f"_{method_gao.method_name}():"
+                )
+                try:
                     source_lines, start_line = inspect.getsourcelines(method_gao.owner)  # type: ignore
                     end_line = start_line + len(source_lines) - 1
-            except (TypeError, OSError):
-                start_line, end_line = -1, -1
-        elif gao.is_function():
-            fn_gao: GenericFunction = gao  # type: ignore
-            function_header = (
-                f"# Unit test for function {fn_gao.function_name}"
-                f"\ndef test_{fn_gao.function_name}():"
-            )
-            try:
-                source_lines, start_line = inspect.getsourcelines(fn_gao.callable)
-                end_line = start_line + len(source_lines) - 1
-            except (TypeError, OSError):
-                start_line, end_line = -1, -1
-        elif gao.is_constructor():
-            constructor_gao: GenericConstructor = gao  # type: ignore
-            class_name = constructor_gao.generated_type().__name__  # type: ignore
-            function_header = (
-                f"# Unit test for constructor of class {class_name}"
-                f"\ndef test_{class_name}():"
-            )
-            try:
-                source_lines, start_line = inspect.getsourcelines(
-                    constructor_gao.generated_type()  # type: ignore
+                    if (
+                        sum(
+                            [
+                                self._get_num_tokens_at_line(i)
+                                for i in range(start_line, end_line + 1)
+                            ]
+                        )
+                        > self._max_query_len
+                    ):
+                        source_lines, start_line = inspect.getsourcelines(method_gao.owner)  # type: ignore
+                        end_line = start_line + len(source_lines) - 1
+                except (TypeError, OSError):
+                    start_line, end_line = -1, -1
+            elif gao.is_function():
+                fn_gao: GenericFunction = gao  # type: ignore
+                function_header = (
+                    f"# Unit test for function {fn_gao.function_name}"
+                    f"\ndef test_{fn_gao.function_name}():"
                 )
-                end_line = start_line + len(source_lines)
-            except (TypeError, OSError):
-                start_line, end_line = -1, -1
+                try:
+                    source_lines, start_line = inspect.getsourcelines(fn_gao.callable)
+                    end_line = start_line + len(source_lines) - 1
+                except (TypeError, OSError):
+                    start_line, end_line = -1, -1
+            elif gao.is_constructor():
+                constructor_gao: GenericConstructor = gao  # type: ignore
+                class_name = constructor_gao.generated_type().__name__  # type: ignore
+                function_header = (
+                    f"# Unit test for constructor of class {class_name}"
+                    f"\ndef test_{class_name}():"
+                )
+                try:
+                    source_lines, start_line = inspect.getsourcelines(
+                        constructor_gao.generated_type()  # type: ignore
+                    )
+                    end_line = start_line + len(source_lines)
+                except (TypeError, OSError):
+                    start_line, end_line = -1, -1
 
-        completion = self._call_completion(
-            context + function_header, start_line, end_line
-        )
-        # Remove any trailing statements that don't parse
-        generated_test = fixup_result(function_header + completion)
-        report_dir = config.configuration.statistics_output.report_dir
-        if report_dir != "pynguin-report":
-            with open(
-                os.path.join(report_dir, "codex_generations.py"),
-                "a+",
-                encoding="UTF-8",
-            ) as log_file:
-                log_file.write(f"\n\n# Generated at {datetime.now()}\n")
-                log_file.write(generated_test)
-        generated_tests: Dict[str, str] = rewrite_tests(generated_test)
-        for test_name in generated_tests:
-            if test_name in function_header:
-                return generated_tests[test_name]
-        return ""
+            completion = self._call_completion(
+                context + function_header, start_line, end_line
+            )
+            # Remove any trailing statements that don't parse
+            generated_test = fixup_result(function_header + completion)
+            report_dir = config.configuration.statistics_output.report_dir
+            if report_dir != "pynguin-report":
+                with open(
+                    os.path.join(report_dir, "codex_generations.py"),
+                    "a+",
+                    encoding="UTF-8",
+                ) as log_file:
+                    log_file.write(f"\n\n# Generated at {datetime.now()}\n")
+                    log_file.write(generated_test)
+            generated_tests: Dict[str, str] = rewrite_tests(generated_test)
+            for test_name in generated_tests:
+                if test_name in function_header:
+                    return generated_tests[test_name]
+            return ""
+        finally:
+            self.inner_tracker.stop()
+            local_kwh = self.inner_tracker._total_energy.kWh
+            logger.info("[Energy]")
+            logger.info("  [codecarbon] Targetedgen inner : %.6f kWh", local_kwh)
+            logger.info("  [ecologits]  LLM API   : %.6f kWh", self.llm_energy_kwh)
+            logger.info("  [combined]   Total     : %.6f kWh", local_kwh + self.llm_energy_kwh)
 
 
 class FileMockedModel(_OpenAILanguageModel):

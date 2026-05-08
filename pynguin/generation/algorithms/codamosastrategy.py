@@ -10,7 +10,10 @@ from __future__ import annotations
 import logging
 import os
 from typing import TYPE_CHECKING, List, Set
-
+from codecarbon import EmissionsTracker
+from pynguin.languagemodels.model import languagemodel
+import csv
+from datetime import datetime
 from ordered_set import OrderedSet
 
 import pynguin.configuration as config
@@ -153,6 +156,15 @@ class CodaMOSATestStrategy(AbstractMOSATestStrategy):
         )
 
     def generate_tests(self) -> tsc.TestSuiteChromosome:
+        #starting codecarbon 
+        tracker = EmissionsTracker(
+            project_name="codamosa_sbst",
+            output_dir="/emissions",
+            save_to_file=True,
+            log_level="error",
+        )
+        tracker.start()
+
         self.before_search_start()
         self._number_of_goals = len(self._test_case_fitness_functions)
         stat.set_output_variable_for_runtime_variable(
@@ -195,6 +207,49 @@ class CodaMOSATestStrategy(AbstractMOSATestStrategy):
             self.after_search_iteration(self.create_test_suite(self._archive.solutions))
 
         self.after_search_finish()
+
+        tracker.stop()
+
+        outer_kwh = tracker._total_energy.kWh
+        inner_kwh = languagemodel.inner_tracker._total_energy.kWh
+        ecologits_kwh = languagemodel.llm_energy_kwh #llm only
+        sbst_only_kwh = outer_kwh - inner_kwh #sbst only
+        targeted_gen_kwh = inner_kwh + ecologits_kwh #targetedgen whole
+        overall_kwh  = outer_kwh + ecologits_kwh #overall run
+
+        logger.info("[ENERGY] outer tracker (full SBST run)  : %.6f kWh", outer_kwh)
+        logger.info("[ENERGY] inner tracker (targeted gen CPU only) : %.6f kWh", inner_kwh)
+        logger.info("[ENERGY] ecologits (LLM API only) : %.6f kWh", ecologits_kwh)
+        logger.info("-" * 30)
+        logger.info("[ENERGY] SBST only : %.6f kWh", sbst_only_kwh) # outer - inner 
+        logger.info("[ENERGY] targeted gen : %.6f kWh", targeted_gen_kwh) # inner + ecologits     
+        logger.info("[ENERGY] overall total : %.6f kWh", overall_kwh) # outer + ecologits
+
+        breakdown_csv_path = "/emissions/energy_breakdown.csv"
+        file_exists = os.path.isfile(breakdown_csv_path)
+        with open(breakdown_csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow([
+                    "timestamp", "module",
+                    "outer_tracker_kwh",
+                    "inner_tracker_kwh",
+                    "ecologits_llm_api_kwh",
+                    "sbst_only_kwh",
+                    "targeted_gen_total_kwh",
+                    "overall_total_kwh",
+                ])
+            writer.writerow([
+                datetime.now().isoformat(),
+                config.configuration.module_name,
+                round(outer_kwh, 6),
+                round(inner_kwh, 6),
+                round(ecologits_kwh, 6),
+                round(sbst_only_kwh, 6),
+                round(targeted_gen_kwh, 6),
+                round(overall_kwh, 6),
+            ])
+
         return self.create_test_suite(
             self._archive.solutions
             if len(self._archive.solutions) > 0
